@@ -3,7 +3,7 @@
 /**
  * Plugin Name: National Code Status Dashboard
  * Description: نمایش وضعیت کد ملی کاربران با استفاده از وب سرویس‌های اختصاصی
- * Version: 1.2.0
+ * Version: 1.2.2
  * Author: Your Name
  * Text Domain: national-code-status
  */
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 // تعریف ثابت‌های مورد نیاز
 define('NCS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NCS_PLUGIN_PATH', plugin_dir_path(__FILE__));
-define('NCS_PLUGIN_VERSION', '1.2.0');
+define('NCS_PLUGIN_VERSION', '1.2.2');
 
 // اضافه کردن فایل تبدیل تاریخ
 require_once NCS_PLUGIN_PATH . 'includes/date-converter.php';
@@ -50,6 +50,11 @@ class NationalCodeStatus
 
         // ثبت اینتروال دقیقه‌ای
         add_filter('cron_schedules', array($this, 'add_minute_schedule'));
+
+        // اضافه کردن هوک‌های مدیریت کاربران
+        add_action('init', array($this, 'register_user_role'));
+        add_action('admin_init', array($this, 'check_user_access'));
+        add_action('wp_login', array($this, 'redirect_after_login'), 10, 2);
     }
 
     public function activate()
@@ -84,6 +89,22 @@ class NationalCodeStatus
         if (!get_option('ncs_last_update')) {
             update_option('ncs_last_update', '');
         }
+
+        // ذخیره تاریخ آخرین پویش کامل
+        if (!get_option('ncs_last_complete_scan_date')) {
+            update_option('ncs_last_complete_scan_date', '');
+        }
+
+        // ذخیره پیام تکمیل پویش
+        if (!get_option('ncs_scan_complete_message')) {
+            update_option('ncs_scan_complete_message', '');
+        }
+
+        // اضافه کردن قابلیت به نقش مدیر
+        $admin_role = get_role('administrator');
+        if ($admin_role && !$admin_role->has_cap('view_national_code_status')) {
+            $admin_role->add_cap('view_national_code_status');
+        }
     }
 
     public function deactivate()
@@ -94,6 +115,38 @@ class NationalCodeStatus
     public function init()
     {
         load_plugin_textdomain('national-code-status', false, dirname(plugin_basename(__FILE__)) . '/languages');
+    }
+
+    // ثبت نقش کاربری جدید
+    public function register_user_role()
+    {
+        if (!get_role('national_code_viewer')) {
+            add_role('national_code_viewer', 'مشاهده‌کننده وضعیت کد ملی', array(
+                'read' => true,
+                'view_national_code_status' => true,
+            ));
+        }
+    }
+
+    // بررسی دسترسی کاربر
+    public function check_user_access()
+    {
+        global $pagenow;
+
+        if (is_admin() && $pagenow === 'admin.php' && isset($_GET['page']) && strpos($_GET['page'], 'national-code-') !== false) {
+            if (!current_user_can('view_national_code_status') && !current_user_can('manage_options')) {
+                wp_die('شما دسترسی لازم به این صفحه را ندارید.');
+            }
+        }
+    }
+
+    // تغییر مسیر پس از لاگین برای کاربران اختصاصی
+    public function redirect_after_login($user_login, $user)
+    {
+        if (in_array('national_code_viewer', $user->roles) && !in_array('administrator', $user->roles)) {
+            wp_redirect(admin_url('admin.php?page=national-code-status'));
+            exit;
+        }
     }
 
     // اضافه کردن اینتروال دقیقه‌ای
@@ -159,7 +212,7 @@ class NationalCodeStatus
         add_menu_page(
             'وضعیت کد ملی',
             'وضعیت کد ملی',
-            'manage_options',
+            'view_national_code_status',
             'national-code-status',
             array($this, 'admin_dashboard_page'),
             'dashicons-id',
@@ -225,12 +278,41 @@ class NationalCodeStatus
         $job_status = get_option('ncs_job_status', 'idle');
         $job_counter = get_option('ncs_check_job_counter', 0);
         $last_update = get_option('ncs_last_update', '');
+        $scan_complete_message = get_option('ncs_scan_complete_message', '');
+        $last_complete_scan = get_option('ncs_last_complete_scan_date', '');
 
         include NCS_PLUGIN_PATH . 'templates/dashboard.php';
     }
 
     public function admin_settings_page()
     {
+        $message = '';
+        $message_type = 'success';
+
+        // مدیریت ایجاد کاربر جدید
+        if (isset($_POST['create_ncs_user'])) {
+            $result = $this->create_ncs_user();
+            if ($result['success']) {
+                $message = $result['message'];
+                $message_type = 'success';
+            } else {
+                $message = $result['message'];
+                $message_type = 'error';
+            }
+        }
+
+        // مدیریت حذف کاربر
+        if (isset($_POST['delete_ncs_user']) && isset($_POST['user_id'])) {
+            $result = $this->delete_ncs_user(intval($_POST['user_id']));
+            if ($result['success']) {
+                $message = $result['message'];
+                $message_type = 'success';
+            } else {
+                $message = $result['message'];
+                $message_type = 'error';
+            }
+        }
+
         if (isset($_POST['submit'])) {
             // بررسی nonce برای امنیت
             if (!wp_verify_nonce($_POST['_wpnonce'], 'ncs_settings')) {
@@ -238,16 +320,164 @@ class NationalCodeStatus
             }
 
             // ذخیره تنظیمات
-            update_option('ncs_token', sanitize_text_field($_POST['ncs_token']));
-            update_option('ncs_hashid', sanitize_text_field($_POST['ncs_hashid']));
+            $token = sanitize_text_field($_POST['ncs_token']);
+            $hashid = sanitize_text_field($_POST['ncs_hashid']);
 
-            echo '<div class="notice notice-success is-dismissible"><p>تنظیمات با موفقیت ذخیره شد.</p></div>';
+            if (empty($token)) {
+                $message = 'توکن API الزامی است.';
+                $message_type = 'error';
+            } else {
+                update_option('ncs_token', $token);
+                update_option('ncs_hashid', $hashid);
+                $message = 'تنظیمات با موفقیت ذخیره شد.';
+                $message_type = 'success';
+            }
         }
 
         $token = get_option('ncs_token');
         $hashid = get_option('ncs_hashid');
 
+        // نمایش پیام اگر وجود دارد
+        if ($message) {
+            echo '<div class="notice notice-' . ($message_type === 'error' ? 'error' : 'success') . ' is-dismissible"><p>' . esc_html($message) . '</p></div>';
+        }
+
         include NCS_PLUGIN_PATH . 'templates/settings.php';
+    }
+
+    // ایجاد کاربر جدید
+    private function create_ncs_user()
+    {
+        if (!wp_verify_nonce($_POST['_wpnonce'], 'ncs_create_user')) {
+            return array('success' => false, 'message' => 'خطای امنیتی');
+        }
+
+        if (!current_user_can('manage_options')) {
+            return array('success' => false, 'message' => 'دسترسی غیرمجاز');
+        }
+
+        $username = sanitize_user($_POST['ncs_username']);
+        $email = sanitize_email($_POST['ncs_email']);
+        $password = $_POST['ncs_password'];
+
+        if (username_exists($username)) {
+            return array('success' => false, 'message' => 'نام کاربری از قبل وجود دارد.');
+        }
+
+        if (email_exists($email)) {
+            return array('success' => false, 'message' => 'ایمیل از قبل وجود دارد.');
+        }
+
+        $user_id = wp_create_user($username, $password, $email);
+
+        if (!is_wp_error($user_id)) {
+            $user = new WP_User($user_id);
+            $user->set_role('national_code_viewer');
+
+            return array('success' => true, 'message' => 'کاربر با موفقیت ایجاد شد.');
+        } else {
+            return array('success' => false, 'message' => 'خطا در ایجاد کاربر: ' . $user_id->get_error_message());
+        }
+    }
+
+    // حذف کاربر
+    private function delete_ncs_user($user_id)
+    {
+        if (!wp_verify_nonce($_POST['_wpnonce'], 'ncs_delete_user')) {
+            return array('success' => false, 'message' => 'خطای امنیتی');
+        }
+
+        if (!current_user_can('manage_options')) {
+            return array('success' => false, 'message' => 'دسترسی غیرمجاز');
+        }
+
+        if (current_user_can('delete_user', $user_id)) {
+            wp_delete_user($user_id);
+            return array('success' => true, 'message' => 'کاربر با موفقیت حذف شد.');
+        }
+
+        return array('success' => false, 'message' => 'عدم دسترسی برای حذف کاربر');
+    }
+
+    // نمایش بخش مدیریت کاربران در تنظیمات
+    private function display_user_management_section()
+    {
+        // دریافت تمام کاربران با نقش national_code_viewer
+        $ncs_users = get_users(array(
+            'role' => 'national_code_viewer'
+        ));
+?>
+
+        <div class="ncs-settings-card">
+            <h2>مدیریت کاربران دسترسی</h2>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <!-- فرم ایجاد کاربر جدید -->
+                <div>
+                    <h3>ایجاد کاربر جدید</h3>
+                    <form method="post" action="">
+                        <?php wp_nonce_field('ncs_create_user'); ?>
+                        <table class="form-table">
+                            <tr>
+                                <th scope="row">نام کاربری</th>
+                                <td>
+                                    <input type="text" name="ncs_username" class="regular-text" required>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row">ایمیل</th>
+                                <td>
+                                    <input type="email" name="ncs_email" class="regular-text" required>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row">رمز عبور</th>
+                                <td>
+                                    <input type="password" name="ncs_password" class="regular-text" required>
+                                </td>
+                            </tr>
+                        </table>
+                        <p class="submit">
+                            <input type="submit" name="create_ncs_user" class="button button-primary" value="ایجاد کاربر">
+                        </p>
+                    </form>
+                </div>
+
+                <!-- لیست کاربران موجود -->
+                <div>
+                    <h3>کاربران موجود</h3>
+                    <?php if (!empty($ncs_users)): ?>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr>
+                                    <th>نام کاربری</th>
+                                    <th>ایمیل</th>
+                                    <th>عملیات</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($ncs_users as $user): ?>
+                                    <tr>
+                                        <td><?php echo esc_html($user->user_login); ?></td>
+                                        <td><?php echo esc_html($user->user_email); ?></td>
+                                        <td>
+                                            <form method="post" action="" style="display: inline;">
+                                                <?php wp_nonce_field('ncs_delete_user'); ?>
+                                                <input type="hidden" name="user_id" value="<?php echo $user->ID; ?>">
+                                                <input type="submit" name="delete_ncs_user" class="button button-secondary" value="حذف" onclick="return confirm('آیا از حذف این کاربر مطمئن هستید؟');">
+                                            </form>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    <?php else: ?>
+                        <p>هیچ کاربری ایجاد نشده است.</p>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
+<?php
     }
 
     public function get_dashboard_stats()
@@ -325,6 +555,10 @@ class NationalCodeStatus
         update_option('ncs_job_status', 'idle');
         update_option('ncs_check_job_counter', 0);
 
+        // پاک کردن تاریخ پویش کامل برای اجازه پویش جدید
+        delete_option('ncs_last_complete_scan_date');
+        delete_option('ncs_scan_complete_message');
+
         // تمام کدهای ملی که کارت ندارند را برای بررسی مجدد علامت بزن
         $this->reset_check_status();
     }
@@ -382,6 +616,15 @@ class NationalCodeStatus
             wp_send_json_error('دسترسی غیرمجاز');
         }
 
+        // حذف تاریخ پویش کامل برای اجازه پویش مجدد
+        delete_option('ncs_last_complete_scan_date');
+        delete_option('ncs_scan_complete_message');
+
+        // فعال‌سازی مجدد جاب دوم
+        if (!wp_next_scheduled('ncs_daily_check_job')) {
+            wp_schedule_event(time(), 'ncs_minutely', 'ncs_daily_check_job');
+        }
+
         $result = $this->daily_check_national_codes(true);
 
         if ($result !== false) {
@@ -423,6 +666,8 @@ class NationalCodeStatus
             update_option('ncs_check_job_counter', 0);
             delete_option('ncs_last_check_job_run');
             delete_option('ncs_last_update');
+            delete_option('ncs_last_complete_scan_date');
+            delete_option('ncs_scan_complete_message');
 
             wp_send_json_success('دیتابیس با موفقیت خالی شد. تمام رکوردها حذف شدند.');
         } else {
@@ -438,7 +683,7 @@ class NationalCodeStatus
             wp_send_json_error('خطای امنیتی: Nonce نامعتبر');
         }
 
-        if (!current_user_can('manage_options')) {
+        if (!current_user_can('view_national_code_status')) {
             wp_send_json_error('دسترسی غیرمجاز');
         }
 
@@ -547,18 +792,33 @@ class NationalCodeStatus
             wp_send_json_error('خطای امنیتی: Nonce نامعتبر');
         }
 
+        if (!current_user_can('view_national_code_status')) {
+            wp_send_json_error('دسترسی غیرمجاز');
+        }
+
         $job_status = get_option('ncs_job_status', 'idle');
         $last_run = get_option('ncs_last_check_job_run', '');
         $next_run = wp_next_scheduled('ncs_daily_check_job');
         $job_counter = get_option('ncs_check_job_counter', 0);
         $last_update = get_option('ncs_last_update', '');
+        $scan_complete_message = get_option('ncs_scan_complete_message', '');
+        $last_complete_scan = get_option('ncs_last_complete_scan_date', '');
+
+        $status_message = '';
+        if ($job_status === 'completed_today') {
+            $status_message = 'پویش کامل امروز انجام شده است.';
+        } elseif ($scan_complete_message) {
+            $status_message = $scan_complete_message;
+        }
 
         wp_send_json_success(array(
             'status' => $job_status,
             'last_run' => $last_run ? NationalCodeStatus::format_jalali_date($last_run, 'Y/m/d H:i') : 'هنوز اجرا نشده',
             'next_run' => $next_run ? NationalCodeStatus::format_jalali_date($next_run, 'Y/m/d H:i') : 'زمان‌بندی نشده',
             'counter' => $job_counter,
-            'last_update' => $last_update ? NationalCodeStatus::format_jalali_date($last_update, 'Y/m/d H:i') : 'هنوز بروزرسانی نشده'
+            'last_update' => $last_update ? NationalCodeStatus::format_jalali_date($last_update, 'Y/m/d H:i') : 'هنوز بروزرسانی نشده',
+            'status_message' => $status_message,
+            'last_complete_scan' => $last_complete_scan ? NationalCodeStatus::format_jalali_date($last_complete_scan, 'Y/m/d') : 'هنوز انجام نشده'
         ));
     }
 
@@ -614,12 +874,25 @@ class NationalCodeStatus
 
         global $wpdb;
 
+        // بررسی آیا امروز قبلاً پویش کامل انجام شده یا نه
+        $today = date('Y-m-d');
+        $last_complete_scan = get_option('ncs_last_complete_scan_date', '');
+
+        // اگر امروز پویش کامل انجام شده و اجرای دستی نیست، متوقف شو
+        if ($last_complete_scan === $today && !$manual) {
+            error_log('NCS: Daily complete scan already done today, skipping...');
+            update_option('ncs_job_status', 'completed_today');
+            $this->is_job_running = false;
+            return 0;
+        }
+
         // افزایش شمارنده اجرا
         $job_counter = get_option('ncs_check_job_counter', 0) + 1;
         update_option('ncs_check_job_counter', $job_counter);
 
         // به‌روزرسانی وضعیت جاب به "در حال اجرا"
         update_option('ncs_job_status', 'running');
+        delete_option('ncs_scan_complete_message'); // پاک کردن پیام قبلی
 
         // ذخیره زمان اجرای جاب
         $current_time = current_time('mysql');
@@ -635,7 +908,7 @@ class NationalCodeStatus
             return 0;
         }
 
-        // دریافت حداکثر 13 کد ملی که وضعیت آن‌ها بررسی نشده یا خطا داشته‌اند و کارت ندارند
+        // دریافت کدهای ملی که نیاز به بررسی دارند
         $codes_to_check = $wpdb->get_results(
             "SELECT * FROM $table_name 
              WHERE (status = 'not_checked' OR status = 'error') 
@@ -644,18 +917,28 @@ class NationalCodeStatus
              LIMIT 13"
         );
 
+        // اگر هیچ کدی برای بررسی نیست، پویش کامل شده
         if (empty($codes_to_check)) {
-            error_log('NCS: No codes to check, all are processed or have cards');
+            error_log('NCS: All codes have been checked today - Scan completed');
+
+            // ذخیره تاریخ پویش کامل
+            update_option('ncs_last_complete_scan_date', $today);
             update_option('ncs_job_status', 'completed');
 
-            // اگر هیچ کدی برای بررسی نیست، وضعیت را برای دور بعدی بازنشانی کن
-            $this->reset_check_status();
+            // ذخیره پیام تکمیل پویش
+            $complete_message = 'پویش کامل کدهای ملی با موفقیت انجام شد. جاب دوم متوقف شد.';
+            update_option('ncs_scan_complete_message', $complete_message);
+
+            // غیرفعال کردن جاب دوم تا فردا
+            $this->deactivate_check_job_until_tomorrow();
 
             $this->is_job_running = false;
             return 0;
         }
 
         $processed = 0;
+        $has_429_error = false;
+
         foreach ($codes_to_check as $code) {
             // فقط 13 درخواست در هر اجرا
             if ($processed >= 13) {
@@ -665,32 +948,56 @@ class NationalCodeStatus
             $result = $this->check_single_national_code_api($code->national_code);
             $processed++;
 
+            // بررسی خطای 429
+            if ($result && isset($result['error_code']) && $result['error_code'] === '429') {
+                $has_429_error = true;
+                error_log("NCS: 429 error for national code: {$code->national_code}");
+            }
+
             if ($result !== false) {
                 error_log("NCS: Successfully checked national code: {$code->national_code} (Status: {$result['status']})");
             } else {
                 error_log("NCS: Failed to check national code: {$code->national_code}");
             }
 
-            // تاخیر 4.6 ثانیه بین هر درخواست برای رعایت محدودیت (13 درخواست در دقیقه)
+            // تاخیر 5 ثانیه بین هر درخواست
             if (!$manual) {
-                sleep(5); // تقریباً 5 ثانیه تاخیر
+                sleep(5);
+            }
+
+            // اگر خطای 429 داشتیم و اجرای دستی نیست، متوقف شو
+            if ($has_429_error && !$manual) {
+                error_log('NCS: 429 error detected, stopping job until next execution');
+                break;
             }
         }
 
-        error_log("NCS: Daily check completed. Processed {$processed} national codes. Total executions: {$job_counter}");
+        error_log("NCS: Check completed. Processed {$processed} national codes. Total executions: {$job_counter}");
 
         // ذخیره زمان آخرین بروزرسانی
         update_option('ncs_last_update', $current_time);
 
-        // به‌روزرسانی وضعیت جاب
-        if ($processed > 0) {
+        // اگر اجرای دستی بود، وضعیت را به idle برگردان
+        if ($manual) {
             update_option('ncs_job_status', 'idle');
         } else {
-            update_option('ncs_job_status', 'completed');
+            update_option('ncs_job_status', 'idle');
         }
 
         $this->is_job_running = false;
         return $processed;
+    }
+
+    // غیرفعال کردن جاب دوم تا فردا
+    private function deactivate_check_job_until_tomorrow()
+    {
+        $next_day = strtotime('tomorrow 00:05'); // فردا ساعت 00:05
+        wp_clear_scheduled_hook('ncs_daily_check_job');
+
+        // زمان‌بندی مجدد برای فردا
+        wp_schedule_event($next_day, 'ncs_minutely', 'ncs_daily_check_job');
+
+        error_log('NCS: Check job deactivated until tomorrow');
     }
 
     public function check_single_national_code()
@@ -698,6 +1005,10 @@ class NationalCodeStatus
         // بررسی nonce
         if (!wp_verify_nonce($_POST['nonce'], 'ncs_nonce')) {
             wp_send_json_error('خطای امنیتی: Nonce نامعتبر');
+        }
+
+        if (!current_user_can('view_national_code_status')) {
+            wp_send_json_error('دسترسی غیرمجاز');
         }
 
         $national_code = sanitize_text_field($_POST['national_code']);

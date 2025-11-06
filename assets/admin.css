@@ -622,3 +622,27 @@
     font-weight: bold;
     margin-top: 5px;
 }
+
+/* اضافه کردن به استایل‌های موجود */
+.ncs-user-management {
+    margin-top: 20px;
+}
+
+.ncs-user-list {
+    max-height: 300px;
+    overflow-y: auto;
+    border: 1px solid #ccd0d4;
+    border-radius: 4px;
+}
+
+.ncs-user-item {
+    padding: 10px;
+    border-bottom: 1px solid #f0f0f0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.ncs-user-item:last-child {
+    border-bottom: none;
+}
